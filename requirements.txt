@@ -11,3 +11,14 @@ pywin32>=306
 sounddevice>=0.5.0
 soundfile>=0.13.0
 pycaw>=20251023
+
+# 抖音采集/搬运链路、语音与图片去重实际会 import 的包（原先漏列）
+numpy>=1.26
+imageio-ffmpeg>=0.5.0
+opencv-python-headless>=4.8
+websocket-client>=1.7
+deepseek-tokenizer>=0.3.0
+
+# 可选：只在抖音抓包栈（start_mitm.bat）与一次性环境脚本里用到
+# mitmproxy>=11.0.0
+# comtypes>=1.4.0

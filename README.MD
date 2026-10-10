@@ -100,6 +100,7 @@ LLM 请求会根据 API 优先级选择可用端点，并支持同一请求内�
 
 ## 文档索引
 
+- [环境准备与构建](./SETUP.md)：还差哪些依赖、各自的项目地址、从零构建与验证清单。
 - [配置参考](./config_guide.md)：`config.json` 的字段、取值和示例。
 - [开发指南](./DEV_GUIDE.md)：架构、插件开发、自动插件、LLM 调用链、发送接口与调试约定。
 - [管理命令](./admin_commands.txt)：已提供的管理类命令说明。
@@ -134,7 +135,8 @@ MIT 与 GPL-3.0 兼容；随仓库分发的第三方二进制与素材各自遵�
 
 ### `wcdb_api.dll` 构建过期（错误码 -101 / -1000）
 
-`weflow-core/resources/wcdb/win32/x64/wcdb_api.dll` 是随 WeFlow 5.0.0 分发的**预编译**原生库，
+`weflow-core/resources/wcdb/win32/x64/wcdb_api.dll` 是你从 WeFlow 安装包复制进来的（这份二进制
+**不随本仓库分发**，见 [SETUP.md](./SETUP.md) 第 3 步）。它是**预编译**原生库，
 里面有两个硬编码的构建过期开关，都指向 **2026-09-30 23:59:59**（`InitProtection()` 超时返回
 `-101`，`wcdb_init()` 超时返回 `-1000`）。过期后 `initialize()` 直接失败 —— 日志里是
 `[bootstrap] InitProtection rc=-101`、`InitProtection failed finalCode=-101`，数据库永远打不开。
@@ -156,10 +158,10 @@ MIT 与 GPL-3.0 兼容；随仓库分发的第三方二进制与素材各自遵�
    的 `docs/NATIVE-EXPIRY-GATE.md`；本脚本是同一结论的独立实现，不下载任何二进制。
 
 2. **换用社区预编译版**：`scripts/install_weflow_patch.py` 从上述仓库下载已修补好的
-   `wcdb_api.dll`（SHA-256 固定校验）并替换。⚠️ 注意它对应的上游原版是 **2026-07-07 构建**，
-   比本仓库随附的这份（2026-05-07）新，两者导出表不同：新构建**没有**
-   `wcdb_open_message_cursor_lite`（`weflow-core/src/services/wcdbCore.ts:984` 有绑定，
-   缺失时静默降级），且多出 6 个符号。要保留本仓库当前构建的行为，请用路线 1。
+   `wcdb_api.dll`（SHA-256 固定校验）并替换。⚠️ 它对应的是 **2026-07-07 构建**；如果你从
+   WeFlow 复制进来的是另一个构建（例如 2026-05-07），两者的**导出表并不相同** —— 那个新构建
+   没有 `wcdb_open_message_cursor_lite`（`weflow-core/src/services/wcdbCore.ts:984` 有绑定，
+   缺失时会静默降级），另外多出 6 个符号。只想解决过期问题就别换构建，用路线 1。
 
 > 重装、修复安装或升级 WeFlow 都会把该 DLL 覆盖回过期版本，届时重跑一次即可。
 > 同目录的 `welive.exe`（本仓库未分发）另有**独立**的过期开关（FILETIME `2026-07-31 16:00 UTC`），
