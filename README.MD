@@ -129,3 +129,38 @@ MIT 与 GPL-3.0 兼容；随仓库分发的第三方二进制与素材各自遵�
 - 抖音搬运的视频库根目录由环境变量 `DOUYIN_LIB_DIR` 指定（默认 `D:\douyin_lib`）；
   公网标注页主机名由 `DOUYIN_PUBLIC_HOST` 指定（默认 `label.example.com`）。
 - `tools/` 是抖音采集/搬运/标注流水线（`start_douyin_*.bat` 拉起），配置模板见 `config/*.example.json`。
+
+## 已知问题
+
+### `wcdb_api.dll` 构建过期（错误码 -101 / -1000）
+
+`weflow-core/resources/wcdb/win32/x64/wcdb_api.dll` 是随 WeFlow 5.0.0 分发的**预编译**原生库，
+里面有两个硬编码的构建过期开关，都指向 **2026-09-30 23:59:59**（`InitProtection()` 超时返回
+`-101`，`wcdb_init()` 超时返回 `-1000`）。过期后 `initialize()` 直接失败 —— 日志里是
+`[bootstrap] InitProtection rc=-101`、`InitProtection failed finalCode=-101`，数据库永远打不开。
+与微信版本、解密密钥、资源路径都无关，`npm run build` 也修不了，因为问题在**分发出来的二进制**里。
+
+两条修复路线，任选其一，都要先完全停掉 weflow-core：
+
+1. **就地改 6 字节（推荐）**：`scripts/patch_wcdb_api_expiry.py` 按字节签名定位这两处判断，
+   把"条件跳到成功出口"改成"无条件跳到同一出口"，只改 6 个字节，文件大小、导出表和其他代码不变：
+
+   ```powershell
+   .\stop_all.bat
+   .\.venv\Scripts\python.exe scripts\patch_wcdb_api_expiry.py --check   # 只检查，不写文件
+   .\.venv\Scripts\python.exe scripts\patch_wcdb_api_expiry.py           # 就地修补，自动备份
+   ```
+
+   备份是 DLL 同目录的 `wcdb_api.dll.bak-expiry`，回滚即拷回。原理与逐字节分析来自社区项目
+   [AnonymousUser443/WeFlow-Community-Patch](https://github.com/AnonymousUser443/WeFlow-Community-Patch)
+   的 `docs/NATIVE-EXPIRY-GATE.md`；本脚本是同一结论的独立实现，不下载任何二进制。
+
+2. **换用社区预编译版**：`scripts/install_weflow_patch.py` 从上述仓库下载已修补好的
+   `wcdb_api.dll`（SHA-256 固定校验）并替换。⚠️ 注意它对应的上游原版是 **2026-07-07 构建**，
+   比本仓库随附的这份（2026-05-07）新，两者导出表不同：新构建**没有**
+   `wcdb_open_message_cursor_lite`（`weflow-core/src/services/wcdbCore.ts:984` 有绑定，
+   缺失时静默降级），且多出 6 个符号。要保留本仓库当前构建的行为，请用路线 1。
+
+> 重装、修复安装或升级 WeFlow 都会把该 DLL 覆盖回过期版本，届时重跑一次即可。
+> 同目录的 `welive.exe`（本仓库未分发）另有**独立**的过期开关（FILETIME `2026-07-31 16:00 UTC`），
+> 且带自校验，不要修改它的 `.text`。

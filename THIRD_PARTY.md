@@ -34,6 +34,13 @@
 | `assets/images/*`（含 `BlueArchive.png`、`Ba Logo.png`） | 二次元素材，版权归原权利方 |
 | `music-source/星海音乐源 v2.3.11.js` | 第三方洛雪（LX Music）音源脚本，无授权声明（其余同目录脚本未分发，见 `music-source/README.md`） |
 | `tools/douyin_*.py` 中的接口签名算法 | 与抖音前端行为相关，仅供学习研究 |
+| `scripts/install_weflow_patch.py` | 社区补丁的安装器（`wcdb_api.dll` 过期修复，见 README「已知问题」）。文件头自述为 AGPL-3.0 代码；AGPL-3.0 与 GPL-3.0 兼容，但会把 AGPL §13 的网络使用条款引入组合作品。若不需要，删除该文件、改用 `scripts/patch_wcdb_api_expiry.py`（本仓库自有，GPL-3.0）即可 |
+
+> **关于 `weflow-core/resources/wcdb/**` 的许可**：其中的 WCDB 本体来自腾讯
+> [Tencent/wcdb](https://github.com/Tencent/wcdb)（BSD 3-Clause）；但社区补丁项目称，WeFlow
+> 随包分发的这几个**预编译包装二进制**沿用 **CC BY-NC-SA 4.0（非商业 + 相同方式共享）**。
+> CC BY-NC-SA 与 GPL-3.0 不兼容（NC 限制），本仓库按上游现状原样保留以供运行。若用于商业场景，
+> 请自行向上游确认授权，或改为不随仓库分发、让使用者从自己的 WeFlow 安装目录复制这些文件。
 
 ## 三、未随仓库分发（请自行获取）
 
