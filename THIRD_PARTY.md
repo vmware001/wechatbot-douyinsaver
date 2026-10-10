@@ -2,9 +2,11 @@
 
 本仓库的第一方源码以 **GPL-3.0-or-later** 发布（见 [LICENSE](./LICENSE)）。
 
-上游项目 [oldicecube/GSMPSWechatBot](https://github.com/oldicecube/GSMPSWechatBot) 以 **MIT** 许可发布，
+**本项目基于 [oldicecube/GSMPSWechatBot](https://github.com/oldicecube/GSMPSWechatBot) 整理发布。**
+原项目地址 <https://github.com/oldicecube/GSMPSWechatBot>，作者 **oldicecube**，以 **MIT** 许可发布，
 其原始版权声明保留在 [LICENSE-MIT](./LICENSE-MIT)。MIT 与 GPL-3.0 兼容，本项目在 MIT 授权的原始代码
 基础上继续以 GPL-3.0 发布；第三方组件各自遵循其原有许可，不因本仓库的 GPL 授权而改变。
+来源与修改内容另见 [NOTICE.md](./NOTICE.md)。
 
 ---
 

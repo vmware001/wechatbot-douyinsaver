@@ -1,5 +1,9 @@
 # GSMPS WeChat Bot
 
+> **声明**：本项目基于 [oldicecube/GSMPSWechatBot](https://github.com/oldicecube/GSMPSWechatBot)
+> （作者 **oldicecube**，MIT 许可）整理发布；本仓库是脱敏后的二次发布副本，功能与架构未做删改。
+> 来源、修改内容与许可关系见 [NOTICE.md](./NOTICE.md)、[THIRD_PARTY.md](./THIRD_PARTY.md) 与 [LICENSE-MIT](./LICENSE-MIT)。
+
 一个运行在 Windows 上、基于 WeFlow 的微信机器人框架。它将群消息接收、命令插件、自动事件、LLM 对话和统一消息发送组合在一起，可用于构建具备上下文、记忆与群聊互动能力的微信机器人。
 
 ## 核心能力
