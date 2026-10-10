@@ -1,0 +1,9 @@
+{
+  "api_token": "your-cloudflare-api-token",
+  "hostname": "label.example.com",
+  "zone": "example.com",
+  "tunnel_name": "douyin-label",
+  "service": "http://127.0.0.1:9998",
+  "tunnel_id": "00000000-0000-0000-0000-000000000000",
+  "tunnel_token": "your-cloudflare-tunnel-token"
+}

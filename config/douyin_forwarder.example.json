@@ -1,0 +1,29 @@
+{
+  "watch_dir": "D:\\douyin_lib\\douyin_saved",
+  "target": "Your Target Group",
+  "allowed_targets": [
+    "Your Target Group",
+    "root"
+  ],
+  "burst_interval_seconds": 7200,
+  "max_compilation_seconds": 300,
+  "max_segment_seconds": 20,
+  "min_segment_seconds": 2,
+  "merge_min_ratio": 2.0,
+  "merge_min_digg": 5,
+  "image_seconds": 2,
+  "quiet_hours": {
+    "start": "23:00",
+    "end": "09:00"
+  },
+  "chat_hold": {
+    "enabled": true,
+    "window_minutes": 10,
+    "min_messages": 5,
+    "messages_file": "C:\\GSMPSWechatBot\\data\\groups\\Your Target Group\\group_messages.json"
+  },
+  "min_file_age_seconds": 60,
+  "sender_url": "http://localhost:9999/wxSend",
+  "token": "your-weflow-token",
+  "forwarded_log": "C:\\GSMPSWechatBot\\data\\douyin_saved\\forwarded.json"
+}

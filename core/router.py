@@ -1,0 +1,531 @@
+import json
+import re
+import os
+import time
+import threading
+from datetime import datetime
+from core.auto_registry import get_raw_message_targets
+from core.followup import peek as peek_followup
+from core.followup import consume as consume_followup
+
+
+class Router:
+    def __init__(
+        self,
+        prefix,
+        target_group,
+        time_slots=None,
+        rate_limit_cfg=None,
+        prefix_mode="strict",
+        proactive_enabled=False,
+    ):
+        # 处理prefix，支持单个字符串或数组
+        if isinstance(prefix, str):
+            self.prefixes = [prefix] if prefix.strip() else []
+        elif isinstance(prefix, (list, tuple)):
+            self.prefixes = [str(p).strip() for p in prefix if str(p).strip()]
+        else:
+            self.prefixes = []
+
+        self.prefix_mode = self._normalize_prefix_mode(prefix_mode)
+        self.proactive_enabled = bool(proactive_enabled)
+        
+        self.target_groups = self._normalize_target_groups(target_group)
+        self.blacklist_file = "data/blacklist.json"
+        
+        # 时间段和速率限制
+        self.time_slots = time_slots or []
+        self.rate_limit_cfg = rate_limit_cfg or {}
+        
+        # wxid速率限制计数器：{wxid: [timestamp, ...]}
+        self.rate_limit_tracking = {}
+        # 全局速率限制计数器：[timestamp, ...]
+        self.global_rate_limit_tracking = []
+        self.rate_limit_violation_tracking = {}
+        # 惰性清理的时间戳：超过10分钟无活动的 wxid 键会被移除
+        self._rate_limit_last_cleanup = 0.0
+        # 黑名单缓存：按文件 mtime 失效，避免每条消息都读盘
+        self._blacklist_cache = None
+        self._blacklist_cache_mtime = None
+        self.auto_blacklist_enabled = bool(
+            self.rate_limit_cfg.get("auto_blacklist_enabled", False)
+        )
+        self.auto_blacklist_threshold = self._safe_int(
+            self.rate_limit_cfg.get("auto_blacklist_threshold"),
+            default=0
+        )
+        self.rate_limit_lock = threading.Lock()
+
+    # =========================================================
+    # 🚦 解析入口
+    # =========================================================
+    def parse(self, msg):
+
+        # =========================
+        # ⓪ 黑名单检测（优先级最高）
+        # 若 wxid 在 blacklist.json 中，直接拦截
+        # =========================
+        wxid = msg.get("wxid")
+
+        if self._is_blacklisted(wxid):
+            return None
+
+        # 昵称与 bot 重名（前缀去掉@）的人直接拦截：
+        # 否则回复会以「@bot …」开头，形成自指召唤，可能死循环
+        if self.is_bot_nickname_collision(msg.get("user")):
+            print(f"[ROUTER] 昵称与bot重名，直接拦截: {msg.get('user')}")
+            return None
+
+        # =========================
+        # ① 时间段检测
+        # =========================
+        if not self._is_in_time_slot():
+            return None
+
+        # =========================
+        # ② 群过滤
+        # =========================
+        if not self._is_target_group(msg.get("group")):
+            return None
+
+        raw_content = msg.get("content", "")
+        content = self._clean(raw_content)
+
+        user = msg.get("user", "未知用户")
+        group = msg.get("group")
+        session_id = msg.get("sessionId")
+
+        has_prefix = self._has_prefix(content)
+
+        # 对于已进入 follow-up 等待态的会话，放行下一条跟随消息，
+        # 但只交给登记的目标插件处理，不恢复普通无前缀消息。
+        # 特殊处理：如果是命令消息，先释放follow-up，再让后续逻辑处理命令
+        followup = peek_followup(session_id, wxid=wxid)
+        if followup:
+            # 检查是否为命令消息（cleaned content 以/开头）
+            is_cmd = content.strip().startswith("/")
+            
+            if is_cmd:
+                # 命令消息：先释放followup，然后继续处理这条命令
+                consume_followup(session_id, wxid=wxid)
+                print(f"[ROUTER] 检测到待处理命令，先释放pending的followup")
+                # 不返回，继续往下处理命令
+            else:
+                # 非命令消息：正常进入followup处理
+                return {
+                    "command": None,
+                    "args": None,
+                    "user": user,
+                    "group": group,
+                    "sessionId": session_id,
+                    "content": content,
+                    "type": "auto",
+                    "raw": msg,
+                    "auto_target": followup.get("target"),
+                    "followup_payload": followup.get("payload") or {},
+                    "wxid": wxid,
+                    "prefix_used": False
+                }
+
+        # Strict mode remains a hard boundary for ordinary messages, but not for
+        # the follow-up branch above.
+        if self.prefix_mode == "strict" and not has_prefix:
+            return None
+
+        raw_targets = get_raw_message_targets()
+        has_prefix = self._has_prefix(content)
+        after_prefix, used_prefix = self._resolve_routing_content(content)
+
+        if (raw_targets or self.proactive_enabled) and self.prefix_mode == "only" and not has_prefix:
+            # =========================
+            # ③ 速率限制检测
+            # =========================
+            if not self._check_rate_limit(wxid):
+                return None
+                
+            return {
+                "command": None,
+                "args": None,
+                "user": user,
+                "group": group,
+                "sessionId": session_id,
+                "content": content,
+                "type": "auto",
+                "raw": msg,
+                "auto_target": raw_targets,
+                "wxid": wxid,
+                "prefix_used": False,
+                "proactive_candidate": self.proactive_enabled
+            }
+
+        if after_prefix is None:
+            return None
+
+        # =========================
+        # ③ 速率限制检测
+        # =========================
+        if not self._check_rate_limit(wxid):
+            return None
+
+        # =========================
+        # 🚨 AUTO 事件
+        # =========================
+        auto_event = {
+            "command": None,
+            "args": None,
+            "user": user,
+            "group": group,
+            "sessionId": session_id,
+            "content": after_prefix,
+            "type": "auto",
+            "raw": msg,
+            "wxid": wxid,
+            "prefix_used": used_prefix,
+            "proactive_candidate": self.proactive_enabled
+        }
+
+        # =========================
+        # ② 只有 prefix 或 prefix + 空格（空 @，无正文）
+        # → 交给 LLM 自由发挥（原路由到 /default_status 插件，已删除，无响应）
+        # =========================
+        if used_prefix and not after_prefix:
+            auto_event["content"] = "（对方只是@了你一下，什么都没说。请就上面的聊天内容插一句嘴：点评、吐槽或接个梗都行，别问对方有什么事）"
+            return auto_event
+
+        # =========================
+        # ④ 命令匹配
+        # =========================
+        match = re.match(r"(/[a-zA-Z0-9_\u4e00-\u9fff\u3400-\u4dbf]+)(?:\s+([\s\S]*))?$", after_prefix)
+
+        if not match:
+            return auto_event
+
+        # =========================
+        # ⑤ 命令解析
+        # =========================
+        command = match.group(1)
+        after = (match.group(2) or "").strip()
+
+        return {
+            "command": command,
+            "args": after,
+            "user": user,
+            "group": group,
+            "sessionId": session_id,
+            "content": after,
+            "type": "command",
+            "raw": msg,
+            "wxid": wxid,
+            "prefix_used": used_prefix
+        }
+
+    def inspect_message(self, msg):
+        raw_content = msg.get("content", "")
+        content = self._clean(raw_content)
+
+        return {
+            "group": msg.get("group"),
+            "sessionId": msg.get("sessionId"),
+            "user": msg.get("user", "未知用户"),
+            "wxid": msg.get("wxid"),
+            "content": content,
+            "message_id": msg.get("messageKey") or msg.get("rawid"),
+            "local_id": msg.get("localId"),
+            "server_id": msg.get("serverIdRaw") or msg.get("serverId") or msg.get("svrid") or msg.get("rawid"),
+            "is_target_group": self._is_target_group(msg.get("group")),
+            "has_prefix": self._has_prefix(content),
+            "is_command_like": content.strip().startswith("/")
+        }
+
+    # =========================================================
+    # 🚫 黑名单检测
+    # data/blacklist.json 示例：
+    # {
+    #   "wxid_xxx": true,
+    #   "wxid_yyy": true
+    # }
+    # =========================================================
+    def is_bot_nickname_collision(self, nickname):
+        """昵称是否与 bot 名字冲突（由前缀推导，如 @bot -> bot）。
+
+        以 bot 名字开头即算冲突（"bot111"、"bot二号"等），
+        防止回复里的「@bot…」前缀被这类昵称持有者利用造成自指循环。
+        """
+        name = str(nickname or "").strip()
+        if not name:
+            return False
+        for prefix in self.prefixes:
+            protected = str(prefix or "").lstrip("@").strip()
+            if protected and name.startswith(protected):
+                return True
+        return False
+
+    def _is_blacklisted(self, wxid):
+        if not wxid:
+            return False
+        try:
+            mtime = os.path.getmtime(self.blacklist_file)
+        except OSError:
+            # 文件不存在视为空黑名单，且不缓存（可能正在写入）
+            return False
+        if self._blacklist_cache is None or self._blacklist_cache_mtime != mtime:
+            try:
+                with open(self.blacklist_file, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+            except Exception:
+                return False
+            self._blacklist_cache = data if isinstance(data, dict) else {}
+            self._blacklist_cache_mtime = mtime
+        return wxid in self._blacklist_cache
+
+    def _add_to_blacklist(self, wxid):
+        if not wxid:
+            return False
+        try:
+            with open(self.blacklist_file, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except Exception:
+            data = {}
+
+        if wxid in data:
+            return True
+
+        data[wxid] = True
+        try:
+            with open(self.blacklist_file, "w", encoding="utf-8") as f:
+                json.dump(data, f, ensure_ascii=False, indent=2)
+        except Exception:
+            return False
+
+        print(f"[ROUTER] auto blacklisted wxid: {wxid}")
+        return True
+
+    def _record_rate_limit_violation(self, wxid):
+
+        if not wxid:
+            return
+
+        if not self.auto_blacklist_enabled or self.auto_blacklist_threshold <= 0:
+            return
+
+        violations = self.rate_limit_violation_tracking.get(wxid, 0) + 1
+        self.rate_limit_violation_tracking[wxid] = violations
+
+        if violations < self.auto_blacklist_threshold:
+            print(
+                f"[ROUTER] rate limit violation {wxid}: "
+                f"{violations}/{self.auto_blacklist_threshold}"
+            )
+            return
+
+        if self._add_to_blacklist(wxid):
+            self.rate_limit_violation_tracking.pop(wxid, None)
+
+    def _safe_int(self, value, default=0):
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return default
+
+    # =========================================================
+    # 🧼 文本清洗
+    # =========================================================
+    def _clean(self, content: str):
+
+        if not isinstance(content, str):
+            return ""
+
+        # 去微信前缀
+        content = re.sub(r"wxid_.*?:", "", content)
+
+        # 空白字符统一
+        content = content.replace("\u2005", " ")
+        content = content.replace("\u200b", " ")
+        content = content.replace("　", " ")
+
+        return content.strip()
+
+    def _normalize_target_groups(self, target_group):
+        if isinstance(target_group, str):
+            group = target_group.strip()
+            return {group} if group else set()
+
+        if isinstance(target_group, (list, tuple, set)):
+            return {
+                str(group).strip()
+                for group in target_group
+                if str(group).strip()
+            }
+
+        return set()
+
+    def _normalize_prefix_mode(self, prefix_mode):
+        mode = str(prefix_mode or "strict").strip().lower()
+
+        alias_map = {
+            "strict": "strict",
+            "only": "strict",
+            "仅": "strict",
+            "on": "strict",
+            "mixed": "mixed",
+            "混合": "mixed",
+            "both": "mixed"
+        }
+
+        normalized = alias_map.get(mode, "strict")
+        print(f"[ROUTER] prefix_mode = {normalized}")
+        return normalized
+
+    def _is_target_group(self, group):
+        if not self.target_groups:
+            return False
+
+        if not isinstance(group, str):
+            return False
+
+        return group.strip() in self.target_groups
+
+    # =========================================================
+    # ⏰ 时间段检测
+    # =========================================================
+    def _is_in_time_slot(self):
+        """检查当前时间是否在配置的时间段内"""
+        if not self.time_slots:
+            return True  # 如果没有配置时间段，则始终允许
+
+        now = datetime.now().time()
+        now_minutes = now.hour * 60 + now.minute
+
+        for slot in self.time_slots:
+            start_str = slot.get("start", "00:00")
+            end_str = slot.get("end", "23:59")
+
+            try:
+                start_time = datetime.strptime(start_str, "%H:%M").time()
+                end_time = datetime.strptime(end_str, "%H:%M").time()
+
+                start_minutes = start_time.hour * 60 + start_time.minute
+                end_minutes = end_time.hour * 60 + end_time.minute
+
+                # 跨天处理
+                if start_minutes <= end_minutes:
+                    if start_minutes <= now_minutes <= end_minutes:
+                        return True
+                else:
+                    # 跨午夜
+                    if now_minutes >= start_minutes or now_minutes <= end_minutes:
+                        return True
+            except Exception as e:
+                print(f"[ROUTER] 时间段解析错误: {e}")
+                continue
+
+        return False
+
+    # =========================================================
+    # 💨 速率限制检测
+    # =========================================================
+    def _check_rate_limit(self, wxid):
+        """检查该wxid是否超过每分钟消息限制，同时检查全局限制"""
+        if not wxid:
+            return True
+
+        per_user_limit = self.rate_limit_cfg.get("messages_per_minute")
+        global_limit = self.rate_limit_cfg.get("global_messages_per_minute")
+
+        with self.rate_limit_lock:
+            current_time = time.time()
+            one_minute_ago = current_time - 60
+
+            # 惰性清理（每分钟至多一次）：删除超过10分钟无活动的 wxid 键，
+            # 避免 rate_limit_tracking / rate_limit_violation_tracking 无限增长
+            if current_time - self._rate_limit_last_cleanup > 60:
+                self._rate_limit_last_cleanup = current_time
+                self._cleanup_rate_limit_tracking(current_time)
+
+            # =========== 检查全局速率限制 ===========
+            if global_limit and global_limit > 0:
+                # 清理一分钟外的记录
+                self.global_rate_limit_tracking = [
+                    ts for ts in self.global_rate_limit_tracking
+                    if ts > one_minute_ago
+                ]
+
+                # 检查是否超过全局限制
+                if len(self.global_rate_limit_tracking) >= global_limit:
+                    print(f"[ROUTER] 全局消息超过速率限制 ({global_limit}/min)")
+                    return False
+
+            # =========== 检查个人速率限制 ===========
+            if not per_user_limit or per_user_limit <= 0:
+                # 如果没有个人限制但有全局限制，记录并通过
+                if global_limit and global_limit > 0:
+                    self.global_rate_limit_tracking.append(current_time)
+                return True
+
+            # 初始化或清理旧记录
+            if wxid not in self.rate_limit_tracking:
+                self.rate_limit_tracking[wxid] = []
+
+            # 清理一分钟外的记录
+            self.rate_limit_tracking[wxid] = [
+                ts for ts in self.rate_limit_tracking[wxid]
+                if ts > one_minute_ago
+            ]
+
+            # 检查是否超过个人限制
+            if len(self.rate_limit_tracking[wxid]) >= per_user_limit:
+                print(f"[ROUTER] {wxid} 超过速率限制 ({per_user_limit}/min)")
+                self._record_rate_limit_violation(wxid)
+                return False
+
+            # 同时记录个人消息和全局消息
+            self.rate_limit_tracking[wxid].append(current_time)
+            if global_limit and global_limit > 0:
+                self.global_rate_limit_tracking.append(current_time)
+            return True
+
+    def _cleanup_rate_limit_tracking(self, now):
+        """删除超过10分钟无消息的 wxid 键（违规计数随消息活动一起过期）"""
+        cutoff = now - 600
+        for key in [
+            k for k, v in self.rate_limit_tracking.items()
+            if not v or v[-1] <= cutoff
+        ]:
+            self.rate_limit_tracking.pop(key, None)
+            self.rate_limit_violation_tracking.pop(key, None)
+
+    # =========================================================
+    # 🎯 检查是否有前缀
+    # =========================================================
+    def _has_prefix(self, content):
+        """检查内容是否以任何配置的前缀开头"""
+        for prefix in self.prefixes:
+            if content == prefix or content.startswith(f"{prefix} "):
+                return True
+        return False
+
+    def _resolve_routing_content(self, content):
+        """根据 prefix_mode 决定是否需要命中前缀，以及最终参与路由的内容"""
+        after_prefix = self._extract_after_prefix(content)
+
+        if self.prefix_mode == "strict":
+            if after_prefix is None:
+                return None, False
+            return after_prefix, True
+
+        if after_prefix is not None:
+            return after_prefix, True
+
+        return content, False
+
+    # =========================================================
+    # 📝 提取前缀后的内容
+    # =========================================================
+    def _extract_after_prefix(self, content):
+        """提取前缀后的内容，如果没有前缀则返回None"""
+        for prefix in self.prefixes:
+            if content == prefix:
+                return ""
+            elif content.startswith(f"{prefix} "):
+                return content[len(prefix) + 1:].strip()
+        return None

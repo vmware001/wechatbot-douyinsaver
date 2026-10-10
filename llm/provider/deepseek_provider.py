@@ -1,0 +1,1604 @@
+# -*- coding: utf-8 -*-
+"""多协议 LLM API 池 Provider。
+
+DeepSeekProvider 是历史类名，实际从 ``llm.apis`` 读取按 ``priority``
+排序的 API 池，并支持 ``openai``（Chat Completions）、``responses``
+（OpenAI Responses）和 ``anthropic``（Anthropic Messages）。
+
+每笔请求从最高优先级且未停用的 API 开始；失败时在同一笔请求内依次
+回退。单路连续 3 次请求失败后仍保留在 API 池中，但临时调整到队末 30 分钟；该路请求成功后清零连续失败计数并恢复原优先级。Responses 的 system 提示词放在 ``instructions``；工具定义
+会从 Chat Completions 的嵌套 ``function`` 结构转换为 Responses 所需的
+顶层 ``name`` / ``description`` / ``parameters`` 结构。缓存是否可用及
+自动缓存能力由所配置的服务端决定，Anthropic 的 ``auto_cached`` 仅应在
+服务商明确支持时启用。
+"""
+
+import json
+import os
+import sys
+import threading
+import time
+import traceback
+from datetime import datetime, timedelta
+
+import httpx
+from openai import OpenAI
+
+from llm.prompt_capture import capture_prompt
+
+# 部分网关会按浏览器 User-Agent 放行。统一带上浏览器 UA，避免被
+# 误判为非浏览器客户端。
+BROWSER_UA = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/120.0 Safari/537.36"
+)
+
+
+# =========================================================
+# 解释器退出保护
+# =========================================================
+# 热重载/优雅退出时解释器进入 finalization，httpx/httpcore 在新建同步连接时
+# 会调用 atexit.register，此时会抛 "can't register atexit after shutdown"。
+# 做法：在模块导入时（解释器尚健康）注册回调置位标志；一旦置位，
+# 任何后台线程都不得再新建 OpenAI/httpx 客户端或发起新的 LLM 请求，
+# 统一抛 ProviderShuttingDown 快速失败（上层会静默丢弃，不发错误消息）。
+#
+# 自愈机制：置位后每次检查都会做一次“存活探测”（能否在当前进程新建 httpx
+# 客户端）。若进程仍健康（例如 httpx 竞态误报/曾短暂进入退出流程又恢复），
+# 自动清除标志并继续服务，避免一次误置位让 bot 永久沉默、所有消息静默丢弃。
+# 真正的解释器退出时探测必然失败，仍会快速失败并静默丢弃。
+_INTERP_SHUTTING_DOWN = threading.Event()
+_SHUTDOWN_LOCK = threading.RLock()
+_SHUTDOWN_AT = None       # 置位时刻（time.monotonic），诊断用
+_SHUTDOWN_SOURCE = None   # 置位来源：atexit / threading_atexit / httpx_race
+_LAST_SHUTDOWN_DIAGNOSTIC_AT = 0.0
+_SHUTDOWN_DIAGNOSTIC_INTERVAL_SECONDS = 10.0
+
+
+class ProviderShuttingDown(RuntimeError):
+    """解释器退出中，禁止再发起新的 LLM 请求。"""
+
+
+def _mark_interp_shutdown(source="atexit"):
+    """置位退出标志，并记录来源与置位时刻（幂等，仅首次生效）。"""
+    global _SHUTDOWN_AT, _SHUTDOWN_SOURCE
+    with _SHUTDOWN_LOCK:
+        _INTERP_SHUTTING_DOWN.set()
+        if _SHUTDOWN_AT is None:
+            _SHUTDOWN_AT = time.monotonic()
+            _SHUTDOWN_SOURCE = source
+            print(f"[LLM] 解释器退出保护置位 source={source}", flush=True)
+            _shutdown_diagnostic(f"guard_marked:{source}")
+
+
+# 用普通 atexit 注册置位回调：本模块 import 较晚，atexit 按 LIFO 执行，
+# 因此 finalization 一开始（其它 atexit handler 运行前）就会置位标志，
+# 尽早拦截后台线程新建 OpenAI/httpx 客户端；再额外用 threading._register_atexit
+# 注册一次作为兜底（在线程 join 前再次置位，幂等无副作用）。
+import atexit
+
+try:
+    atexit.register(lambda: _mark_interp_shutdown("atexit"))
+except Exception:
+    pass
+
+_atexit_registerer = getattr(threading, "_register_atexit", None)
+if _atexit_registerer is not None:
+    try:
+        _atexit_registerer(lambda: _mark_interp_shutdown("threading_atexit"))
+    except Exception:
+        pass
+
+
+def _threading_shutdown_started():
+    """Return whether threading shutdown has started."""
+    try:
+        return bool(getattr(threading, "_SHUTTING_DOWN", False))
+    except Exception:
+        return True
+
+
+def _shutdown_diagnostic(reason, exc=None):
+    """Best-effort diagnostic wrapper: diagnostics must never affect shutdown."""
+    try:
+        _shutdown_diagnostic_impl(reason, exc)
+    except Exception:
+        pass
+
+
+def _shutdown_diagnostic_impl(reason, exc=None):
+    """Emit rate-limited local diagnostics; never send this to WeChat."""
+    global _LAST_SHUTDOWN_DIAGNOSTIC_AT
+    now = time.monotonic()
+    with _SHUTDOWN_LOCK:
+        if now - _LAST_SHUTDOWN_DIAGNOSTIC_AT < _SHUTDOWN_DIAGNOSTIC_INTERVAL_SECONDS:
+            return
+        _LAST_SHUTDOWN_DIAGNOSTIC_AT = now
+    try:
+        thread_info = [{"name": t.name, "daemon": t.daemon, "alive": t.is_alive()} for t in threading.enumerate()]
+    except Exception as thread_exc:
+        thread_info = [{"error": f"{type(thread_exc).__name__}: {thread_exc}"}]
+    details = {
+        "reason": reason,
+        "pid": os.getpid(),
+        "thread": threading.current_thread().name,
+        "main_thread_alive": threading.main_thread().is_alive(),
+        "sys_finalizing": _runtime_is_finalizing(),
+        "threading_shutting_down": _threading_shutdown_started(),
+        "guard_set": _INTERP_SHUTTING_DOWN.is_set(),
+        "guard_source": _SHUTDOWN_SOURCE,
+        "threads": thread_info,
+    }
+    if exc is not None:
+        details["error"] = f"{type(exc).__name__}: {exc}"
+        details["traceback"] = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__, limit=8)).strip()
+    print("[LLM SHUTDOWN DIAGNOSTIC] " + json.dumps(details, ensure_ascii=False, default=str), flush=True)
+
+def _runtime_is_finalizing():
+    """Return whether CPython is already finalizing the interpreter."""
+    checker = getattr(sys, "is_finalizing", None)
+    if not callable(checker):
+        return False
+    try:
+        return bool(checker())
+    except Exception:
+        # A failure to probe finalization is treated conservatively as shutdown.
+        return True
+
+
+def _is_shutdown_registration_error(exc):
+    """Recognize the interpreter-shutdown error raised by httpx/OpenAI clients."""
+    text = str(exc or "").casefold()
+    return "atexit" in text and "shutdown" in text
+
+
+def _probe_interpreter_alive():
+    """Probe whether a lightweight HTTP client can still be constructed safely."""
+    if _runtime_is_finalizing():
+        return False
+    try:
+        client = httpx.Client(timeout=httpx.Timeout(2.0))
+        client.close()
+        return not _runtime_is_finalizing()
+    except Exception:
+        return False
+
+
+def _shutting_down():
+    """Return whether new LLM requests must be suppressed during shutdown."""
+    # In Python 3.14 this is the exact state behind
+    # "can't register atexit after shutdown". A successful temporary httpx
+    # construction does not make a following SDK request safe once it is true.
+    if _runtime_is_finalizing() or _threading_shutdown_started():
+        _shutdown_diagnostic("runtime_shutdown_state")
+        return True
+    if not _INTERP_SHUTTING_DOWN.is_set():
+        return False
+    if _probe_interpreter_alive():
+        global _SHUTDOWN_AT, _SHUTDOWN_SOURCE
+        with _SHUTDOWN_LOCK:
+            if _runtime_is_finalizing() or _threading_shutdown_started():
+                _shutdown_diagnostic("shutdown_started_during_probe")
+                return True
+            _INTERP_SHUTTING_DOWN.clear()
+            _SHUTDOWN_AT = None
+            _SHUTDOWN_SOURCE = None
+        print("[LLM] cleared stale shutdown guard; runtime is healthy", flush=True)
+        return False
+    _shutdown_diagnostic("guarded_shutdown_probe_failed")
+    return True
+
+
+def _parse_clock(value, default):
+    """解析 'HH:MM' 为当天分钟数；非法返回 default。"""
+    try:
+        parts = str(value).strip().split(":")
+        hour = int(parts[0])
+        minute = int(parts[1]) if len(parts) > 1 else 0
+        if not (0 <= hour <= 23 and 0 <= minute <= 59):
+            raise ValueError
+        return hour * 60 + minute
+    except (TypeError, ValueError, IndexError):
+        return default
+
+
+def compute_daily_reset_minute(time_slots):
+    """计算每日重置时刻（0..1439 分钟）。
+
+    重置时刻 = 每日最早的不响应时间段起点，即响应窗口结束时间（按当天折算）。
+    未配置 time_slots（或全部非法）时返回 0，表示每日 0 点。
+    """
+    if not time_slots:
+        return 0
+    ends = []
+    for slot in time_slots:
+        if not isinstance(slot, dict):
+            continue
+        start = _parse_clock(slot.get("start"), None)
+        end = _parse_clock(slot.get("end"), None)
+        if start is None or end is None:
+            continue
+        if end <= start:
+            end += 1440  # 跨午夜窗口（如 08:00 -> 02:00）
+        ends.append(end % 1440)
+    if not ends:
+        return 0
+    return min(ends)
+
+
+def _cache_control_dict(ttl=""):
+    """构建 Anthropic cache_control；ttl='1h' 时显式延长缓存生存期。"""
+    cache_control = {"type": "ephemeral"}
+    if str(ttl or "").strip().lower() in ("1h", "3600"):
+        cache_control["ttl"] = "1h"
+    return cache_control
+
+
+def _content_to_text(content):
+    """把 OpenAI 消息 content（str / 文本块列表 / tool_result）转成纯文本。"""
+    if content is None:
+        return ""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts = []
+        for block in content:
+            if isinstance(block, dict):
+                btype = block.get("type")
+                if btype == "text":
+                    parts.append(str(block.get("text") or ""))
+                elif btype == "tool_result":
+                    parts.append(_content_to_text(block.get("content")))
+            else:
+                parts.append(str(block))
+        return "\n".join(part for part in parts if part)
+    return str(content)
+
+
+def _to_anthropic_tools(tools):
+    """OpenAI function tools -> Anthropic tools 数组。"""
+    result = []
+    for tool in tools or []:
+        if isinstance(tool, dict):
+            fn = tool.get("function") or {}
+            name = str(fn.get("name") or "")
+            description = str(fn.get("description") or "")
+            parameters = fn.get("parameters") or {"type": "object", "properties": {}}
+        else:
+            fn = getattr(tool, "function", None)
+            name = str(getattr(fn, "name", "") or "")
+            description = str(getattr(fn, "description", "") or "")
+            parameters = getattr(fn, "parameters", None) or {"type": "object", "properties": {}}
+        if not name:
+            continue
+        result.append({
+            "name": name,
+            "description": description,
+            "input_schema": parameters,
+        })
+    return result
+
+
+def _to_responses_tools(tools):
+    """Convert Chat Completions function tools to Responses function tools.
+
+    Chat Completions nests the definition under `function`; Responses uses
+    the same outer `type` but puts `name`, `description` and
+    `parameters` at the top level. Passing the nested shape through causes
+    gateways to report `tools[0].name` as missing.
+    """
+    result = []
+    for tool in tools or []:
+        if isinstance(tool, dict):
+            fn = tool.get("function") or tool
+            tool_type = str(tool.get("type") or "function")
+            name = str(fn.get("name") or "")
+            description = str(fn.get("description") or "")
+            parameters = fn.get("parameters") or {"type": "object", "properties": {}}
+            strict = fn.get("strict", tool.get("strict"))
+        else:
+            fn = getattr(tool, "function", None) or tool
+            tool_type = str(getattr(tool, "type", None) or "function")
+            name = str(getattr(fn, "name", "") or "")
+            description = str(getattr(fn, "description", "") or "")
+            parameters = getattr(fn, "parameters", None) or {"type": "object", "properties": {}}
+            strict = getattr(fn, "strict", None)
+        if not name:
+            continue
+        converted = {
+            "type": tool_type,
+            "name": name,
+            "description": description,
+            "parameters": parameters,
+        }
+        if strict is not None:
+            converted["strict"] = bool(strict)
+        result.append(converted)
+    return result
+
+
+def _merge_consecutive(messages):
+    """合并连续同角色消息（Anthropic 不允许同角色连续）。"""
+    merged = []
+    for msg in messages:
+        if merged and merged[-1]["role"] == msg["role"]:
+            prev = merged[-1]["content"]
+            cur = msg["content"]
+            if isinstance(prev, str) and isinstance(cur, list):
+                base = [{"type": "text", "text": prev}] if prev else []
+                merged[-1]["content"] = base + cur
+            elif isinstance(prev, list) and isinstance(cur, str):
+                if cur:
+                    prev.append({"type": "text", "text": cur})
+            elif isinstance(prev, str) and isinstance(cur, str):
+                merged[-1]["content"] = (prev + "\n" + cur) if (prev and cur) else (prev or cur)
+            elif isinstance(prev, list) and isinstance(cur, list):
+                prev.extend(cur)
+        else:
+            merged.append(dict(msg))
+    return merged
+
+
+def _to_anthropic_content(content):
+    """Convert OpenAI-style multimodal content to Anthropic content blocks."""
+    if isinstance(content, str):
+        return content
+    if not isinstance(content, list):
+        return str(content or "")
+
+    blocks = []
+    for block in content:
+        if not isinstance(block, dict):
+            continue
+        block_type = str(block.get("type") or "")
+        if block_type == "text":
+            text = str(block.get("text") or "")
+            if text:
+                blocks.append({"type": "text", "text": text})
+            continue
+        if block_type != "image_url":
+            continue
+        image_value = block.get("image_url")
+        if isinstance(image_value, dict):
+            image_url = str(image_value.get("url") or "")
+        else:
+            image_url = str(image_value or "")
+        if image_url.startswith("data:image/") and "," in image_url:
+            header, encoded = image_url.split(",", 1)
+            media_type = header[5:].split(";", 1)[0].strip().lower() or "image/png"
+            blocks.append({
+                "type": "image",
+                "source": {
+                    "type": "base64",
+                    "media_type": media_type,
+                    "data": encoded,
+                },
+            })
+        elif image_url.startswith(("http://", "https://")):
+            # Some Anthropic-compatible gateways accept URL sources; keep this
+            # fallback for gateways that do, while WeFlow normally supplies data URLs.
+            blocks.append({
+                "type": "image",
+                "source": {"type": "url", "url": image_url},
+            })
+    return blocks or ""
+
+
+def _to_responses_content(content):
+    """Convert OpenAI chat content blocks to Responses input content blocks."""
+    if isinstance(content, str):
+        return content
+    if not isinstance(content, list):
+        return str(content or "")
+
+    blocks = []
+    for block in content:
+        if not isinstance(block, dict):
+            continue
+        block_type = str(block.get("type") or "")
+        if block_type == "text":
+            text = str(block.get("text") or "")
+            if text:
+                blocks.append({"type": "input_text", "text": text})
+        elif block_type == "image_url":
+            image_value = block.get("image_url")
+            if isinstance(image_value, dict):
+                image_url = str(image_value.get("url") or "")
+            else:
+                image_url = str(image_value or "")
+            if image_url:
+                blocks.append({"type": "input_image", "image_url": image_url})
+    return blocks or ""
+
+
+def _to_anthropic_messages(messages, cache_enabled=False, cache_ttl="", cache_mode="auto"):
+    """OpenAI 消息 -> (system_text, Anthropic messages)。
+
+    cache_enabled=True 且 cache_mode='manual' 时按 cache_breakpoint 位置
+    给聊天上下文注入 cache_control，让服务端缓存该前缀；
+    cache_mode='auto' 时不注入消息内断点，改由请求层 auto_cached=true
+    让网关自动计算最长稳定前缀，cache_ttl 只作为 TTL 计时声明。
+    cache_ttl='1h' 表示 1 小时 TTL，云端缓存会自动续期，最长支持 5 小时。
+    """
+    system_parts = []
+    out = []
+    for msg in messages or []:
+        if not isinstance(msg, dict):
+            continue
+        role = msg.get("role")
+        content = msg.get("content")
+        if role == "system":
+            text = _content_to_text(content)
+            if text:
+                system_parts.append(text)
+            continue
+        if role == "user":
+            converted_content = _to_anthropic_content(content)
+            text = _content_to_text(content)
+            if (
+                cache_enabled
+                and cache_mode == "manual"
+                and msg.get("cache_breakpoint")
+                and text
+                and isinstance(converted_content, str)
+            ):
+                out.append({
+                    "role": "user",
+                    "content": [{
+                        "type": "text",
+                        "text": text,
+                        "cache_control": _cache_control_dict(cache_ttl),
+                    }],
+                })
+            else:
+                out.append({"role": "user", "content": converted_content})
+        elif role == "assistant":
+            text = _content_to_text(content)
+            blocks = []
+            if text:
+                blocks.append({"type": "text", "text": text})
+            for tc in msg.get("tool_calls") or []:
+                if isinstance(tc, dict):
+                    tc_id = str(tc.get("id") or "")
+                    fn = tc.get("function") or {}
+                    fn_name = str(fn.get("name") or "")
+                    args = fn.get("arguments") or "{}"
+                else:
+                    tc_id = str(getattr(tc, "id", "") or "")
+                    fn = getattr(tc, "function", None)
+                    fn_name = str(getattr(fn, "name", "") or "")
+                    args = getattr(fn, "arguments", "{}") or "{}"
+                if not isinstance(args, str):
+                    args = json.dumps(args, ensure_ascii=False)
+                try:
+                    input_obj = json.loads(args) if str(args).strip() else {}
+                except (TypeError, ValueError):
+                    input_obj = {}
+                blocks.append({
+                    "type": "tool_use",
+                    "id": tc_id or f"toolu_{len(blocks)}",
+                    "name": fn_name,
+                    "input": input_obj,
+                })
+            out.append({"role": "assistant", "content": blocks if blocks else text})
+        elif role == "tool":
+            tool_use_id = str(msg.get("tool_call_id") or "")
+            tool_text = _content_to_text(msg.get("content")) or ""
+            if not out or out[-1]["role"] != "user":
+                out.append({"role": "user", "content": ""})
+            if isinstance(out[-1]["content"], str):
+                base = [{"type": "text", "text": out[-1]["content"]}] if out[-1]["content"] else []
+                out[-1]["content"] = base
+            out[-1]["content"].append({
+                "type": "tool_result",
+                "tool_use_id": tool_use_id,
+                "content": tool_text,
+            })
+    system_text = "\n".join(part for part in system_parts if part).strip()
+    return system_text, _merge_consecutive(out)
+
+
+def _responses_instructions(messages):
+    """提取 system 消息为 Responses 顶层 instructions 文本（无则返回空串）。
+
+    OpenAI Responses 规范中 system 不放入 input items，而应作为顶层
+    ``instructions`` 参数传递，避免兼容网关忽略自定义 system 或改写它。
+    """
+    parts = []
+    for msg in messages or []:
+        if not isinstance(msg, dict):
+            continue
+        if msg.get("role") == "system":
+            text = _content_to_text(msg.get("content"))
+            if text:
+                parts.append(text)
+    return "\n\n".join(part for part in parts if part).strip()
+
+
+def _to_responses_input(messages, include_cache_breakpoints=False):
+    """OpenAI chat messages -> OpenAI Responses input items.
+
+    GPT-5.6 retains implicit/automatic caching by default. ``cache_breakpoint``
+    merely adds an explicit checkpoint to an immutable history record; it does
+    not switch the request into an explicit-only cache mode.
+    """
+    items = []
+    for msg in messages or []:
+        if not isinstance(msg, dict):
+            continue
+        role = msg.get("role")
+        if role == "system":
+            continue
+        if role == "user":
+            original_content = msg.get("content")
+            content = _content_to_text(original_content)
+            converted_content = _to_responses_content(original_content)
+            if (
+                include_cache_breakpoints
+                and msg.get("cache_breakpoint")
+                and isinstance(converted_content, str)
+            ):
+                items.append({
+                    "role": "user",
+                    "content": [{
+                        "type": "input_text",
+                        "text": content,
+                        "prompt_cache_breakpoint": {"mode": "explicit"},
+                    }],
+                })
+            else:
+                items.append({"role": "user", "content": converted_content})
+        elif role == "assistant":
+            content = _content_to_text(msg.get("content"))
+            tool_calls = msg.get("tool_calls") or []
+            if tool_calls:
+                items.append({"role": "assistant", "content": content or None})
+                for call in tool_calls:
+                    if isinstance(call, dict):
+                        call_id = str(call.get("id") or "")
+                        function = call.get("function") or {}
+                        name = str(function.get("name") or "")
+                        arguments = function.get("arguments") or "{}"
+                    else:
+                        call_id = str(getattr(call, "id", "") or "")
+                        function = getattr(call, "function", None)
+                        name = str(getattr(function, "name", "") or "")
+                        arguments = getattr(function, "arguments", "{}") or "{}"
+                    if not isinstance(arguments, str):
+                        arguments = json.dumps(arguments, ensure_ascii=False)
+                    items.append({
+                        "type": "function_call",
+                        "call_id": call_id,
+                        "name": name,
+                        "arguments": arguments,
+                    })
+            else:
+                items.append({"role": "assistant", "content": content})
+        elif role == "tool":
+            items.append({
+                "type": "function_call_output",
+                "call_id": str(msg.get("tool_call_id") or ""),
+                "output": _content_to_text(msg.get("content")) or "",
+            })
+    return items
+
+
+def _responses_breakpoint_count(items) -> int:
+    """Count explicit markers without logging any prompt content."""
+    return sum(
+        1
+        for item in items or []
+        if isinstance(item, dict) and isinstance(item.get("content"), list)
+        for block in item["content"]
+        if isinstance(block, dict) and block.get("prompt_cache_breakpoint")
+    )
+
+
+def _responses_breakpoint_unsupported(exc) -> bool:
+    error_text = str(exc or "").lower()
+    return "prompt_cache_breakpoint" in error_text and any(
+        token in error_text for token in ("unknown", "unsupported", "unrecognized", "invalid", "extra fields")
+    )
+
+
+class _SimpleFunction:
+    def __init__(self, name, arguments):
+        self.name = name
+        self.arguments = arguments
+
+
+class _SimpleToolCall:
+    def __init__(self, id, name, arguments):
+        self.id = id
+        self.function = _SimpleFunction(name, arguments)
+
+
+class _SimpleMessage:
+    """非 pydantic 的消息对象，兼容 llm_service 的 _assistant_message_dict。"""
+
+    def __init__(self, content, tool_calls=None, usage=None):
+        self.content = content
+        self.tool_calls = tool_calls or []
+        self.usage = usage or {}
+
+
+def _render_messages_for_log(messages, max_chars=60000):
+    """日志用请求原文渲染：多模态图片块打码，避免 base64 刷屏。"""
+    lines = []
+    total = 0
+    for index, message in enumerate(messages or [], 1):
+        if isinstance(message, dict):
+            role = str(message.get("role") or "unknown")
+            content = message.get("content")
+        else:
+            role, content = "unknown", message
+        if isinstance(content, list):
+            blocks = []
+            for block in content:
+                if isinstance(block, dict) and block.get("type") == "image_url":
+                    url = str((block.get("image_url") or {}).get("url") or "")
+                    blocks.append(f"[image: base64 {len(url)} chars]")
+                elif isinstance(block, dict) and block.get("type") == "text":
+                    blocks.append(str(block.get("text") or ""))
+                else:
+                    blocks.append(str(block))
+            content = " ".join(blocks)
+        line = f"  [{index}] {role}: {content}"
+        total += len(line)
+        if total > max_chars:
+            lines.append(f"  ... [truncated: request too long, >{max_chars} chars]")
+            break
+        lines.append(line)
+    return "\n".join(lines)
+
+
+# =========================================================
+# 单端点客户端
+# =========================================================
+
+class OpenAICompatibleClient:
+    """单个 OpenAI Chat Completions 兼容端点。"""
+
+    # 端点把请求里的 max_tokens 判为超限时的错误特征（用来决定是否去掉重试）
+    _MAX_TOKENS_REJECT_MARKERS = (
+        "max_tokens",
+        "max_completion_tokens",
+        "max output tokens",
+        "maximum output",
+        "maxoutputtokens",
+    )
+
+    def __init__(self, entry):
+        self.entry = entry
+        self.name = entry["name"]
+        self.model = entry["model"]
+        self.supports_images = bool(entry.get("supports_images", False))
+        self.timeout = entry["timeout_seconds"]
+        self.last_usage = {}
+        # 输出上限（config.json: llm.apis[].max_tokens）。0 = 不传，用端点的默认值。
+        # 2026-09-27 之前这里根本没读 max_tokens，配置里写的值对 openai 协议端点
+        # 完全是死配置（只有 responses / anthropic 协议在用）。/pro 报告"输出被
+        # 截断"后把它接上，让配置能真正控制单次输出上限。
+        self.max_tokens = int(entry.get("max_tokens") or 0)
+        # 全量提示词（含群聊记录、画像、记忆）默认不再打印到日志，
+        # 调试时在该 API 配置里设 "log_full_prompt": true 打开
+        self.log_full_prompt = bool(entry.get("log_full_prompt", False))
+        # Automatic Responses caching is widely supported; the GPT-specific
+        # content-block breakpoint extension is not.  Keep it opt-in per API.
+        self._explicit_cache_breakpoints_enabled = bool(
+            self.entry.get("responses_explicit_cache_breakpoint", False)
+        )
+        self._init_client()
+        # 缓存范围：full（完整前缀缓存）/ system（仅系统提示词）/ none（不可缓存）。
+        scope = str(self.entry.get("cache_scope") or "").strip().lower()
+        if scope not in {"full", "system", "none"}:
+            scope = 'full'
+        self.cache_scope = scope
+
+    def _init_client(self):
+        if _shutting_down():
+            raise ProviderShuttingDown("LLM provider is shutting down")
+        api_key = self.entry["api_key"]
+        base_url = self.entry["base_url"]
+        try:
+            http_client = httpx.Client(timeout=httpx.Timeout(self.timeout))
+            self._client = OpenAI(
+                api_key=api_key,
+                base_url=base_url,
+                http_client=http_client,
+                max_retries=0,
+                default_headers={"User-Agent": BROWSER_UA},
+            )
+        except RuntimeError as exc:
+            if not _is_shutdown_registration_error(exc):
+                raise
+            _mark_interp_shutdown("httpx_client_init")
+            _shutdown_diagnostic("httpx_client_init_error", exc)
+            raise ProviderShuttingDown("LLM provider is shutting down") from exc
+
+    def chat(self, messages, tools=None, prompt_cache_key=None, model=None):
+        """调用该端点，返回 assistant 消息（含工具调用）。"""
+        if _shutting_down():
+            raise ProviderShuttingDown("LLM provider is shutting down")
+        kwargs = {
+            "model": str(model or self.model),
+            "messages": messages,
+        }
+        if tools:
+            kwargs["tools"] = tools
+            kwargs["tool_choice"] = "auto"
+        else:
+            kwargs["response_format"] = {"type": "json_object"}
+        if self.max_tokens > 0:
+            kwargs["max_tokens"] = self.max_tokens
+
+        try:
+            if self.log_full_prompt:
+                print(
+                    f"[LLM REQUEST] api={self.name} model={kwargs['model']} "
+                    f"messages={len(messages)} tools={len(tools) if tools else 0}\n"
+                    + _render_messages_for_log(messages),
+                    flush=True,
+                )
+            else:
+                print(
+                    f"[LLM REQUEST] api={self.name} model={kwargs['model']} "
+                    f"messages={len(messages)} tools={len(tools) if tools else 0}",
+                    flush=True,
+                )
+            capture_prompt(kwargs["messages"])
+            response = self._create_completion(kwargs)
+            self._log_usage(response)
+            return response.choices[0].message
+        except httpx.TimeoutException as exc:
+            print(
+                f"[LLM TIMEOUT] api={self.name} error={type(exc).__name__} "
+                f"messages={len(messages)} chars={self._message_chars(messages)} "
+                f"estimated_tokens={self._estimate_tokens(messages)}",
+                flush=True,
+            )
+            raise
+        except Exception as exc:
+            if _is_shutdown_registration_error(exc):
+                _mark_interp_shutdown("openai_chat_request")
+                _shutdown_diagnostic("openai_chat_request_error", exc)
+                raise ProviderShuttingDown("LLM provider is shutting down") from exc
+            error_text = str(exc).lower()
+            if any(marker in error_text for marker in (
+                "context length", "maximum context", "too many tokens", "request too large",
+                "payload too large", "413", "prompt is too long",
+            )):
+                print(
+                    f"[LLM CONTEXT LIMIT] api={self.name} error={type(exc).__name__} "
+                    f"messages={len(messages)} chars={self._message_chars(messages)} "
+                    f"estimated_tokens={self._estimate_tokens(messages)}",
+                    flush=True,
+                )
+            raise
+
+    def _create_completion(self, kwargs):
+        """发起一次 chat.completions；max_tokens 被端点判为超限时去掉它重试一次。
+
+        各端点的单次输出上限不同，配置里的 max_tokens 只按主端点（mimo）的实测
+        上限设。万一某个端点/模型的上限更低、带上去会直接 400，去掉重试可以保证
+        "把输出上限调大"不会反而把可用端点打成不可用（极端情况退回端点默认上限）。
+        """
+        try:
+            return self._client.chat.completions.create(**kwargs)
+        except Exception as exc:
+            if "max_tokens" not in kwargs:
+                raise
+            error_text = str(exc).lower()
+            if not any(marker in error_text for marker in self._MAX_TOKENS_REJECT_MARKERS):
+                raise
+            retry_kwargs = dict(kwargs)
+            retry_kwargs.pop("max_tokens", None)
+            print(
+                f"[LLM MAX TOKENS] api={self.name} 端点拒绝 max_tokens="
+                f"{kwargs['max_tokens']}（{type(exc).__name__}: {str(exc)[:160]}），"
+                f"去掉该参数用端点默认上限重试",
+                flush=True,
+            )
+            return self._client.chat.completions.create(**retry_kwargs)
+
+    def _log_usage(self, response):
+        usage = getattr(response, "usage", None)
+        if usage is None:
+            print(f"[LLM TOKENS] api={self.name} usage unavailable", flush=True)
+            return
+        cache_hit = self._usage_value(usage, "prompt_cache_hit_tokens")
+        if cache_hit is None:
+            # OpenAI 风格：cached_tokens 在 prompt_tokens_details 里
+            details = self._usage_value(usage, "prompt_tokens_details")
+            if details is not None:
+                cache_hit = self._usage_value(details, "cached_tokens")
+        fields = {
+            "cached_input": cache_hit,
+            "input": self._usage_value(usage, "prompt_tokens"),
+            "output": self._usage_value(usage, "completion_tokens"),
+            "total": self._usage_value(usage, "total_tokens"),
+            "cache_miss": self._usage_value(usage, "prompt_cache_miss_tokens"),
+        }
+        self.last_usage = {key: value for key, value in fields.items() if value is not None}
+        try:
+            from core import bot_stats
+            bot_stats.record_tokens(
+                model=getattr(self, "model", "") or "",
+                input_tokens=fields.get("input"),
+                cached_input=fields.get("cached_input"),
+                output_tokens=fields.get("output"),
+            )
+        except Exception:
+            pass
+        print(
+            f"[LLM TOKENS] api={self.name} " + " ".join(
+                f"{key}={value}" for key, value in fields.items() if value is not None
+            ),
+            flush=True,
+        )
+        # 前缀缓存命中率遥测（DeepSeek/OpenAI 兼容端点的 prompt_cache_hit/miss 字段）。
+        hit = self._usage_value(usage, "prompt_cache_hit_tokens")
+        miss = self._usage_value(usage, "prompt_cache_miss_tokens")
+        if hit is not None and miss is not None and (hit + miss) > 0:
+            rate = hit / float(hit + miss) * 100
+            print(
+                f"[LLM CACHE] api={self.name} hit_rate={rate:.1f}% hit={hit} miss={miss}",
+                flush=True,
+            )
+
+    @staticmethod
+    def _usage_value(usage, name):
+        if isinstance(usage, dict):
+            return usage.get(name)
+        return getattr(usage, name, None)
+
+    @staticmethod
+    def _message_chars(messages):
+        return sum(len(str(item.get("content") or "")) for item in messages if isinstance(item, dict))
+
+    @classmethod
+    def _estimate_tokens(cls, messages):
+        text = "".join(str(item.get("content") or "") for item in messages if isinstance(item, dict))
+        cjk = sum("\u3400" <= char <= "\u9fff" for char in text)
+        non_cjk = len(text) - cjk
+        return cjk + max(0, (non_cjk + 3) // 4)
+
+    def close(self):
+        if getattr(self, "_closed", False):
+            return
+        self._closed = True
+        try:
+            if getattr(self, "_client", None) is not None and hasattr(self._client, "_client"):
+                self._client._client.close()
+        except Exception:
+            pass
+
+
+class ResponsesClient:
+    """单个 OpenAI Responses 协议端点（base_url/responses）。"""
+
+    def __init__(self, entry):
+        self.entry = entry
+        self.name = entry["name"]
+        self.model = entry["model"]
+        self.supports_images = bool(entry.get("supports_images", False))
+        self.timeout = entry["timeout_seconds"]
+        self.max_output_tokens = int(entry.get("max_tokens") or 0)
+        self.last_usage = {}
+        # Automatic caching is the default. Some compatible gateways reject
+        # GPT-specific explicit breakpoint blocks, so those remain opt-in.
+        self._explicit_cache_breakpoints_enabled = bool(
+            self.entry.get("responses_explicit_cache_breakpoint", False)
+        )
+        self._init_client()
+        # 缓存范围：full（完整前缀缓存）/ system（仅系统提示词）/ none（不可缓存）。
+        scope = str(self.entry.get("cache_scope") or "").strip().lower()
+        if scope not in {"full", "system", "none"}:
+            scope = 'full'
+        self.cache_scope = scope
+
+    def _init_client(self):
+        if _shutting_down():
+            raise ProviderShuttingDown("LLM provider is shutting down")
+        api_key = self.entry["api_key"]
+        base_url = self.entry["base_url"]
+        try:
+            http_client = httpx.Client(timeout=httpx.Timeout(self.timeout))
+            self._client = OpenAI(
+                api_key=api_key,
+                base_url=base_url,
+                http_client=http_client,
+                max_retries=0,
+                default_headers={"User-Agent": BROWSER_UA},
+            )
+        except RuntimeError as exc:
+            if not _is_shutdown_registration_error(exc):
+                raise
+            _mark_interp_shutdown("httpx_client_init")
+            raise ProviderShuttingDown("LLM provider is shutting down") from exc
+
+    def chat(self, messages, tools=None, prompt_cache_key=None, model=None):
+        """Call this endpoint with implicit cache plus one history checkpoint."""
+        if _shutting_down():
+            raise ProviderShuttingDown("LLM provider is shutting down")
+        responses_input = _to_responses_input(
+            messages,
+            include_cache_breakpoints=self._explicit_cache_breakpoints_enabled,
+        )
+        kwargs = {
+            "model": str(model or self.model),
+            "input": responses_input,
+        }
+        instructions = _responses_instructions(messages)
+        if instructions:
+            kwargs["instructions"] = instructions
+        if tools:
+            kwargs["tools"] = _to_responses_tools(tools)
+            kwargs["tool_choice"] = "auto"
+        else:
+            kwargs["text"] = {"format": {"type": "json_object"}}
+        if self.max_output_tokens > 0:
+            kwargs["max_output_tokens"] = self.max_output_tokens
+
+        # Do not set prompt_cache_options.mode=explicit: GPT-5.6's default
+        # implicit/automatic cache remains enabled. The key routes a group/flow
+        # to a stable cache shard and never contains the raw group identifier.
+        cache_enabled = bool(self.entry.get("cache", True)) and self.cache_scope != "none"
+        configured_cache_key = str(self.entry.get("prompt_cache_key") or "").strip()
+        # A configured key is an explicit provider-specific override. In the
+        # normal empty case, route each group/reply flow through the runtime key
+        # generated by LLMService. Both forms are non-content metadata: prompt
+        # equality, not the key alone, still controls automatic prefix reuse.
+        cache_key = configured_cache_key or str(prompt_cache_key or "").strip()
+        cache_key_source = "config" if configured_cache_key else "runtime"
+        if cache_enabled and cache_key:
+            kwargs["prompt_cache_key"] = cache_key
+        breakpoint_count = _responses_breakpoint_count(responses_input)
+        if cache_enabled:
+            print(
+                f"[LLM CACHE REQUEST] api={self.name} mode=implicit "
+                f"key={'yes' if cache_key else 'no'} key_source={cache_key_source if cache_key else 'none'} "
+                f"explicit_breakpoints={breakpoint_count}",
+                flush=True,
+            )
+
+        retried_format = False
+        try:
+            capture_prompt(messages)
+            response = self._client.responses.create(**kwargs)
+            self._log_usage(response)
+            return _responses_message_to_openai(response)
+        except httpx.TimeoutException as exc:
+            print(
+                f"[LLM TIMEOUT] api={self.name} error={type(exc).__name__} "
+                f"messages={len(messages)} chars={OpenAICompatibleClient._message_chars(messages)}",
+                flush=True,
+            )
+            raise
+        except Exception as exc:
+            if _is_shutdown_registration_error(exc):
+                _mark_interp_shutdown("responses_request")
+                _shutdown_diagnostic("responses_request_error", exc)
+                raise ProviderShuttingDown("LLM provider is shutting down") from exc
+            # Keep the request usable with gateways that implement automatic
+            # caching but have not yet added the GPT-5.6 content-block marker.
+            if _responses_breakpoint_unsupported(exc) and breakpoint_count:
+                # Prevent every future call in this process from first paying
+                # for a known-invalid request.
+                self._explicit_cache_breakpoints_enabled = False
+                print(
+                    f"[LLM CACHE FALLBACK] api={self.name} gateway rejected explicit breakpoint; "
+                    "disabling it for this process and retrying automatic caching only",
+                    flush=True,
+                )
+                kwargs["input"] = _to_responses_input(messages, include_cache_breakpoints=False)
+                response = self._client.responses.create(**kwargs)
+                self._log_usage(response)
+                return _responses_message_to_openai(response)
+            if (
+                not tools
+                and not retried_format
+                and any(marker in str(exc).lower() for marker in (
+                    "502", "503", "504", "upstream", "internal server",
+                    "bad gateway", "server error", "must contain the word 'json'",
+                ))
+            ):
+                retried_format = True
+                print(
+                    f"[LLM FORMAT RETRY] api={self.name} "
+                    "Gateway rejected text.format=json_object; retrying without text.format",
+                    flush=True,
+                )
+                kwargs.pop("text", None)
+                response = self._client.responses.create(**kwargs)
+                self._log_usage(response)
+                return _responses_message_to_openai(response)
+            error_text = str(exc).lower()
+            if any(marker in error_text for marker in (
+                "context length", "maximum context", "too many tokens", "request too large",
+                "payload too large", "413", "prompt is too long",
+            )):
+                print(
+                    f"[LLM CONTEXT LIMIT] api={self.name} error={type(exc).__name__} "
+                    f"messages={len(messages)} chars={OpenAICompatibleClient._message_chars(messages)} "
+                    f"estimated_tokens={OpenAICompatibleClient._estimate_tokens(messages)}",
+                    flush=True,
+                )
+            raise
+
+    def _log_usage(self, response):
+        usage = getattr(response, "usage", None)
+        if usage is None:
+            print(f"[LLM TOKENS] api={self.name} usage unavailable", flush=True)
+            return
+        def _val(name):
+            if isinstance(usage, dict):
+                return usage.get(name)
+            return getattr(usage, name, None)
+        def _detail(details, name):
+            if isinstance(details, dict):
+                return details.get(name)
+            return getattr(details, name, None) if details is not None else None
+        details = _val("input_tokens_details")
+        cache_read = _detail(details, "cached_tokens")
+        cache_write = _detail(details, "cache_write_tokens")
+        fields = {
+            "prompt": _val("input_tokens"),
+            "completion": _val("output_tokens"),
+            "total": _val("total_tokens"),
+        }
+        self.last_usage = {k: v for k, v in fields.items() if v is not None}
+        if cache_read is not None:
+            self.last_usage["cache_read"] = cache_read
+        if cache_write is not None:
+            self.last_usage["cache_creation"] = cache_write
+        print(
+            f"[LLM TOKENS] api={self.name} " + " ".join(
+                f"{k}={v}" for k, v in fields.items() if v is not None
+            )
+            + (f" cache_read={cache_read}" if cache_read is not None else "")
+            + (f" cache_creation={cache_write}" if cache_write is not None else ""),
+            flush=True,
+        )
+        input_tokens = fields.get("prompt")
+        if cache_read is not None and input_tokens not in (None, 0):
+            try:
+                hit_rate = max(0.0, min(1.0, float(cache_read) / float(input_tokens)))
+                print(
+                    f"[LLM CACHE] api={self.name} hit_rate={hit_rate:.1%} "
+                    f"hit={cache_read} input={input_tokens}",
+                    flush=True,
+                )
+            except (TypeError, ValueError, ZeroDivisionError):
+                pass
+
+    def close(self):
+        if getattr(self, "_closed", False):
+            return
+        self._closed = True
+        try:
+            if getattr(self, "_client", None) is not None and hasattr(self._client, "_client"):
+                self._client._client.close()
+        except Exception:
+            pass
+
+
+def _responses_message_to_openai(response):
+    """OpenAI Responses 响应 -> 兼容 OpenAI assistant 消息对象。"""
+    text = str(getattr(response, "output_text", None) or "")
+    tool_calls = []
+    for item in getattr(response, "output", None) or []:
+        if getattr(item, "type", None) == "function_call":
+            tool_calls.append(_SimpleToolCall(
+                id=str(getattr(item, "call_id", None) or getattr(item, "id", "") or ""),
+                name=str(getattr(item, "name", "") or ""),
+                arguments=getattr(item, "arguments", "{}") or "{}",
+            ))
+    return _SimpleMessage(content=text, tool_calls=tool_calls, usage=getattr(response, "usage", None))
+
+
+class AnthropicClient:
+    """单个 Anthropic Messages 协议端点（POST {base_url}/v1/messages）。"""
+
+    def __init__(self, entry):
+        self.entry = entry
+        self.name = entry["name"]
+        self.model = entry["model"]
+        self.supports_images = bool(entry.get("supports_images", False))
+        self.timeout = entry["timeout_seconds"]
+        self.max_tokens = int(entry.get("max_tokens") or 4096)
+        # Anthropic 缓存开关与 TTL 归一化（cache / cache_ttl）
+        self.cache_enabled = bool(entry.get("cache", True))
+        self.cache_ttl = str(entry.get("cache_ttl") or "").strip().lower()
+        self.last_usage = {}
+        # cache_scope：full=完整前缀可缓存；system=仅 system 块可缓存；none=关闭缓存
+        scope = str(self.entry.get("cache_scope") or "").strip().lower()
+        if scope not in {"full", "system", "none"}:
+            scope = 'system'
+        self.cache_scope = scope
+        # cache_mode：auto=网关自动缓存（仅声明 TTL）；manual=手动断点；off=关闭
+        cache_mode = str(self.entry.get("cache_mode") or "").strip().lower()
+        if cache_mode not in {"auto", "manual", "off"}:
+            cache_mode = "auto"
+        if scope == "none":
+            cache_mode = "off"
+        self.cache_mode = cache_mode
+        self._closed = False
+        if _shutting_down():
+            raise ProviderShuttingDown("LLM provider is shutting down")
+        try:
+            self._http = httpx.Client(timeout=httpx.Timeout(self.timeout))
+        except RuntimeError as exc:
+            if _is_shutdown_registration_error(exc):
+                _mark_interp_shutdown("anthropic_httpx_client_init")
+                _shutdown_diagnostic("anthropic_httpx_client_init_error", exc)
+                raise ProviderShuttingDown("LLM provider is shutting down") from exc
+            raise
+
+    def chat(self, messages, tools=None, prompt_cache_key=None, model=None):
+        if _shutting_down():
+            raise ProviderShuttingDown("LLM provider is shutting down")
+        # 供 /prompt 等使用的最后一次完整提示词快照（在协议转换前记录 OpenAI 格式）。
+        capture_prompt(messages)
+        system, anth_messages = _to_anthropic_messages(
+            messages,
+            cache_enabled=self.cache_enabled,
+            cache_ttl=self.cache_ttl,
+            cache_mode=self.cache_mode,
+        )
+        body = {
+            "model": str(model or self.model),
+            "max_tokens": self.max_tokens,
+            "messages": anth_messages,
+        }
+        if system:
+            if self.cache_enabled and self.cache_mode != "off":
+                # 仅作为 TTL 计时载体：system 块仍带 cache_control+ttl 声明；
+                # auto 模式不再注入消息内断点，由网关 auto_cached 自动计算最长前缀；
+                body["system"] = [{
+                    "type": "text",
+                    "text": system,
+                    "cache_control": _cache_control_dict(self.cache_ttl),
+                }]
+            else:
+                body["system"] = system
+        if self.cache_enabled and self.cache_mode == "auto":
+            # auto 模式：请求顶层声明 auto_cached=true，网关自动计算最长稳定前缀，
+            # 服务端按 cache_read / cache_creation 计量，无需消息内断点。
+            body["auto_cached"] = True
+        if tools:
+            body["tools"] = _to_anthropic_tools(tools)
+
+        headers = {
+            "x-api-key": self.entry["api_key"],
+            "Authorization": "Bearer " + self.entry["api_key"],
+            "anthropic-version": "2023-06-01",
+            "content-type": "application/json",
+            "User-Agent": BROWSER_UA,
+        }
+        try:
+            resp = self._http.post(
+                self.entry["base_url"].rstrip("/") + "/v1/messages",
+                headers=headers,
+                json=body,
+            )
+        except httpx.TimeoutException as exc:
+            print(
+                f"[LLM TIMEOUT] api={self.name} error={type(exc).__name__} "
+                f"messages={len(messages)} chars={OpenAICompatibleClient._message_chars(messages)}",
+                flush=True,
+            )
+            raise
+        except Exception as exc:
+            if _is_shutdown_registration_error(exc):
+                _mark_interp_shutdown("anthropic_request")
+                _shutdown_diagnostic("anthropic_request_error", exc)
+                raise ProviderShuttingDown("LLM provider is shutting down") from exc
+            raise
+        if resp.status_code >= 400:
+            raise RuntimeError(
+                f"{self.name} HTTP {resp.status_code}: {resp.text[:400]}"
+            )
+        data = resp.json()
+        self._log_usage(data)
+        return _anthropic_message_to_openai(data)
+
+    def _log_usage(self, data):
+        usage = data.get("usage") or {}
+        try:
+            prompt = int(usage.get("input_tokens") or 0)
+            completion = int(usage.get("output_tokens") or 0)
+        except (TypeError, ValueError):
+            prompt = completion = 0
+        try:
+            cache_creation = int(usage.get("cache_creation_input_tokens") or 0)
+            cache_read = int(usage.get("cache_read_input_tokens") or 0)
+        except (TypeError, ValueError):
+            cache_creation = cache_read = 0
+        self.last_usage = {
+            "prompt": prompt,
+            "completion": completion,
+            "total": prompt + completion,
+            "cache_creation": cache_creation,
+            "cache_read": cache_read,
+        }
+        print(
+            f"[LLM TOKENS] api={self.name} prompt={prompt} completion={completion} total={prompt + completion} "
+            f"cache_creation={cache_creation} cache_read={cache_read}",
+            flush=True,
+        )
+
+    def close(self):
+        if getattr(self, "_closed", False):
+            return
+        self._closed = True
+        try:
+            self._http.close()
+        except Exception:
+            pass
+
+
+def _anthropic_message_to_openai(data):
+    """Anthropic 响应 -> 兼容 OpenAI assistant 消息对象。"""
+    text_parts = []
+    tool_calls = []
+    for block in data.get("content") or []:
+        if not isinstance(block, dict):
+            continue
+        btype = block.get("type")
+        if btype == "text":
+            text_parts.append(str(block.get("text") or ""))
+        elif btype == "tool_use":
+            tool_calls.append(_SimpleToolCall(
+                id=str(block.get("id") or ""),
+                name=str(block.get("name") or ""),
+                arguments=block.get("input") or {},
+            ))
+    usage = data.get("usage") or {}
+    try:
+        prompt = int(usage.get("input_tokens") or 0)
+        completion = int(usage.get("output_tokens") or 0)
+        usage_map = {
+            "prompt_tokens": prompt,
+            "completion_tokens": completion,
+            "total_tokens": prompt + completion,
+        }
+    except (TypeError, ValueError):
+        usage_map = {}
+    return _SimpleMessage(
+        content="\n".join(part for part in text_parts if part),
+        tool_calls=tool_calls,
+        usage=usage_map,
+    )
+
+
+# =========================================================
+# 多 API 池
+# =========================================================
+
+class PoolExhaustedError(RuntimeError):
+    """所有 API 均调用失败。"""
+
+    def __init__(self, errors):
+        self.errors = list(errors)
+        combined = "; ".join(self.errors) if self.errors else "all LLM APIs failed"
+        if any("402" in err for err in self.errors):
+            combined = "402 " + combined
+        super().__init__(combined)
+
+
+class DeepSeekProvider:
+    """Priority-ordered multi-API pool with per-request fallback.
+
+    Each request tries every endpoint in priority order. A failed endpoint is
+    retried immediately against the next endpoint in the same request. After
+    three consecutive request failures for one endpoint, that endpoint remains
+    available but is temporarily moved to the end of the pool for 30 minutes.
+    A successful request on that endpoint clears its failure streak and restores
+    its normal priority.
+    """
+
+    def __init__(self):
+        if _shutting_down():
+            raise ProviderShuttingDown("LLM provider is shutting down")
+        from llm.config import get_llm_config
+
+        config = get_llm_config()
+        self.config = config
+        entries = config.get("apis") or []
+        if not entries:
+            raise ValueError("Missing llm api entries (llm.apis)")
+        # Explicit priority: smaller values are tried first; ties retain config order.
+        ordered = sorted(
+            enumerate(entries),
+            key=lambda item: (int(item[1].get("priority") or 0), item[0]),
+        )
+        self._endpoints = [self._build_endpoint(entry) for _, entry in ordered]
+        self._lock = threading.RLock()
+        # Consecutive request failures for each endpoint. A success clears its streak.
+        self._failure_counts = [0 for _ in self._endpoints]
+        # Monotonic deadlines for temporary tail-priority demotions.
+        self._demoted_until = [0.0 for _ in self._endpoints]
+        self._failure_demote_threshold = 3
+        self._failure_demote_seconds = 30 * 60
+        self.last_usage = {}
+        self.last_model = ""
+        print(
+            f"[LLM POOL] Loaded {len(self._endpoints)} API(s): "
+            + ", ".join(
+                f"{i + 1}.{ep.name}({ep.model}, priority={ep.entry.get('priority')})"
+                for i, ep in enumerate(self._endpoints)
+            )
+            + "; consecutive failure demotion: 3 failures -> tail for 30 minutes",
+            flush=True,
+        )
+
+    @staticmethod
+    def _build_endpoint(entry):
+        protocol = str(entry.get("protocol") or "openai").strip().lower()
+        if protocol == "anthropic":
+            return AnthropicClient(entry)
+        if protocol == "responses":
+            return ResponsesClient(entry)
+        return OpenAICompatibleClient(entry)
+
+    def _refresh_temporary_demotions(self):
+        """Restore normal priority for endpoints whose 30-minute tail period ended."""
+        now = time.monotonic()
+        restored = []
+        with self._lock:
+            for index, deadline in enumerate(self._demoted_until):
+                if deadline and deadline <= now:
+                    self._demoted_until[index] = 0.0
+                    restored.append(self._endpoints[index].name)
+        for name in restored:
+            print(
+                f"[LLM POOL] API {name} tail-priority demotion expired; priority restored",
+                flush=True,
+            )
+
+    def _available_indices_in_priority_order(self):
+        """Return normal-priority endpoints followed by temporarily demoted ones."""
+        self._refresh_temporary_demotions()
+        now = time.monotonic()
+        with self._lock:
+            normal = [
+                index
+                for index, deadline in enumerate(self._demoted_until)
+                if not deadline or deadline <= now
+            ]
+            demoted = [
+                index
+                for index, deadline in enumerate(self._demoted_until)
+                if deadline and deadline > now
+            ]
+        return normal + demoted
+
+    def _first_available_index(self):
+        indices = self._available_indices_in_priority_order()
+        return indices[0] if indices else None
+
+    @staticmethod
+    def _endpoint_model_override(endpoint, model_override):
+        """/pro 等模式的全局模型名映射到本端点的 pro_model 配置；
+        未声明的端点（如 fallback）退回自己的默认模型，
+        避免把别家模型名（如 mimo-v2.6-pro）发给 fallback 端点。"""
+        if not model_override:
+            return None
+        pro_model = str(endpoint.entry.get("pro_model") or "").strip()
+        return pro_model or None
+
+    @staticmethod
+    def _filter_tools_for_endpoint(endpoint, tools):
+        """Hide image-only tools from endpoints without multimodal support."""
+        if getattr(endpoint, "supports_images", False):
+            return tools
+        return [
+            tool
+            for tool in (tools or [])
+            if not isinstance(tool, dict) or not tool.get("requires_images")
+        ]
+
+    @staticmethod
+    def _filter_messages_for_endpoint(endpoint, messages):
+        """Avoid sending image blocks to a fallback model that cannot read them."""
+        if getattr(endpoint, "supports_images", False):
+            return messages
+        filtered = []
+        for message in messages or []:
+            if not isinstance(message, dict):
+                filtered.append(message)
+                continue
+            content = message.get("content")
+            if not isinstance(content, list):
+                filtered.append(message)
+                continue
+            blocks = []
+            removed_image = False
+            for block in content:
+                if isinstance(block, dict) and block.get("type") == "image_url":
+                    removed_image = True
+                    continue
+                blocks.append(dict(block) if isinstance(block, dict) else block)
+            if removed_image:
+                blocks.append({
+                    "type": "text",
+                    "text": "（这里原本附了图片，但你当前使用的模型看不了图。如果问题涉及图片内容，直接说明现在看不了图，绝对不要编造或猜测图片里有什么。）",
+                })
+            updated = dict(message)
+            updated["content"] = blocks
+            filtered.append(updated)
+        return filtered
+
+    @property
+    def supports_images(self):
+        """Whether any endpoint currently available in the pool accepts images.
+
+        Individual endpoints are still filtered in ``send_chat``. This permits a
+        multimodal fallback to use the image tool after a text-only primary API
+        fails, without ever exposing that tool to the text-only endpoint.
+        """
+        return any(
+            bool(getattr(self._endpoints[index], "supports_images", False))
+            for index in self._available_indices_in_priority_order()
+        )
+
+    @property
+    def current_api_name(self):
+        index = self._first_available_index()
+        return self._endpoints[index].name if index is not None else ""
+
+    def current_cache_scope(self):
+        """Cache scope of the first endpoint eligible for the next request."""
+        index = self._first_available_index()
+        if index is None:
+            return "none"
+        return getattr(self._endpoints[index], "cache_scope", "none")
+
+    def current_protocol(self):
+        """Protocol used by the endpoint that would receive the next request."""
+        index = self._first_available_index()
+        if index is None:
+            return ""
+        entry = getattr(self._endpoints[index], "entry", {}) or {}
+        return str(entry.get("protocol") or "openai").strip().lower()
+
+    def current_cache_enabled(self):
+        """Whether the next endpoint has request caching enabled in its config."""
+        index = self._first_available_index()
+        if index is None:
+            return False
+        entry = getattr(self._endpoints[index], "entry", {}) or {}
+        return bool(entry.get("cache", True)) and getattr(self._endpoints[index], "cache_scope", "none") != "none"
+
+    def _record_failure(self, index):
+        """Record one consecutive failure and demote after the configured limit."""
+        now = time.monotonic()
+        with self._lock:
+            self._failure_counts[index] += 1
+            failures = self._failure_counts[index]
+            already_demoted = self._demoted_until[index] > now
+            if failures >= self._failure_demote_threshold and not already_demoted:
+                self._demoted_until[index] = now + self._failure_demote_seconds
+            demoted = self._demoted_until[index] > now
+        if demoted and not already_demoted:
+            print(
+                f"[LLM POOL] API {self._endpoints[index].name} reached {failures} "
+                "consecutive failures; moved to tail priority for 30 minutes",
+                flush=True,
+            )
+        return failures, demoted
+
+    def _record_success(self, index):
+        """Clear the selected endpoint's failure streak and restore its priority."""
+        with self._lock:
+            previous = self._failure_counts[index]
+            was_demoted = self._demoted_until[index] > time.monotonic()
+            self._failure_counts[index] = 0
+            self._demoted_until[index] = 0.0
+        if previous or was_demoted:
+            print(
+                f"[LLM POOL] API {self._endpoints[index].name} recovered; "
+                "cleared consecutive failure count and restored priority",
+                flush=True,
+            )
+
+    # 内容审核拒答是以 HTTP 200 + 普通文本的形式返回的（不会抛异常），
+    # 命中后直接换下一个端点重试同一请求。这是内容问题不是端点故障，
+    # 因此不计入连续失败、不触发 30 分钟降级。
+    _HIGH_RISK_REJECTION_TEXT = "rejected because it was considered high risk"
+
+    @classmethod
+    def _is_high_risk_rejection(cls, message) -> bool:
+        content = getattr(message, "content", None)
+        return isinstance(content, str) and cls._HIGH_RISK_REJECTION_TEXT in content.lower()
+
+    def send_chat(self, messages, tools=None, prompt_cache_key=None, model_override=None, prefer_endpoint=None):
+        """Try every endpoint in priority order within the same LLM request.
+
+        model_override: 本次请求临时使用的模型名（如 /pro 专业模式用
+        mimo-v2.6-pro）。作为参数传入 endpoint.chat，不改写共享的
+        endpoint.model——并发槽 >1（dispatcher 按 max_concurrent_requests
+        放行）时改写共享状态会互相串模型。
+        prefer_endpoint: 端点 name，本次请求优先从它开始（如 /pro 固定走
+        某个端点），失败仍按优先级回落到其余端点。
+        """
+        if _shutting_down():
+            raise ProviderShuttingDown("LLM provider is shutting down")
+
+        indices = self._available_indices_in_priority_order()
+        if not indices:
+            raise PoolExhaustedError(["No configured LLM APIs are available"])
+        if prefer_endpoint:
+            preferred = [i for i in indices if self._endpoints[i].name == prefer_endpoint]
+            if preferred:
+                indices = preferred + [i for i in indices if i not in preferred]
+
+        errors = []
+        for attempt, index in enumerate(indices, start=1):
+            endpoint = self._endpoints[index]
+            try:
+                endpoint_tools = self._filter_tools_for_endpoint(endpoint, tools)
+                endpoint_messages = self._filter_messages_for_endpoint(endpoint, messages)
+                message = endpoint.chat(
+                    endpoint_messages,
+                    tools=endpoint_tools,
+                    prompt_cache_key=prompt_cache_key,
+                    model=self._endpoint_model_override(endpoint, model_override),
+                )
+                if self._is_high_risk_rejection(message):
+                    errors.append(f"{endpoint.name}: content rejected as high risk")
+                    if attempt < len(indices):
+                        print(
+                            f"[LLM POOL] API {endpoint.name} 内容审核拒答(high risk)，"
+                            f"换 {self._endpoints[indices[attempt]].name} 重试同一请求",
+                            flush=True,
+                        )
+                    else:
+                        print(
+                            f"[LLM POOL] API {endpoint.name} 内容审核拒答(high risk)，已无可用端点",
+                            flush=True,
+                        )
+                    continue
+                self._record_success(index)
+                self.last_usage = dict(endpoint.last_usage or {})
+                # 记下本次真正使用的模型名，供按群 token 统计归因
+                self.last_model = (
+                    self._endpoint_model_override(endpoint, model_override)
+                    or getattr(endpoint, "model", "")
+                    or ""
+                )
+                return message
+            except Exception as exc:
+                if _shutting_down():
+                    raise ProviderShuttingDown("LLM provider is shutting down") from exc
+                failures, demoted = self._record_failure(index)
+                err_detail = f"{type(exc).__name__}: {str(exc)[:200]}"
+                errors.append(f"{endpoint.name}: {err_detail}")
+                status = "tail priority for 30m" if demoted else f"failure {failures}/{self._failure_demote_threshold}"
+                if attempt < len(indices):
+                    print(
+                        f"[LLM POOL] API {endpoint.name} failed ({status}): {err_detail}; "
+                        f"trying {self._endpoints[indices[attempt]].name} in the same request",
+                        flush=True,
+                    )
+                else:
+                    print(
+                        f"[LLM POOL] API {endpoint.name} failed ({status}): {err_detail}; "
+                        f"no more endpoints",
+                        flush=True,
+                    )
+
+        raise PoolExhaustedError(errors)
+
+    def send(self, messages: list, prompt_cache_key=None, model_override=None, prefer_endpoint=None) -> str:
+        """向后兼容的字符串 API。"""
+        message = self.send_chat(messages, prompt_cache_key=prompt_cache_key, model_override=model_override, prefer_endpoint=prefer_endpoint)
+        return str(getattr(message, "content", None) or "")
+
+    def __del__(self):
+        for endpoint in getattr(self, "_endpoints", []) or []:
+            try:
+                endpoint.close()
+            except Exception:
+                pass

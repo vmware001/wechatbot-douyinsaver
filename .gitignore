@@ -1,0 +1,139 @@
+# ============================
+# 运行时数据（数据库、用户数据、日志）
+# ============================
+data/*.sqlite3
+data/*.sqlite3-shm
+data/*.sqlite3-wal
+data/echo.json
+data/groups/
+data/pics/
+
+# ============================
+# 输出文件
+# ============================
+output/
+
+# ============================
+# Python
+# ============================
+__pycache__/
+*.py[cod]
+*.pyo
+*.egg-info/
+dist/
+build/
+.eggs/
+*.egg
+
+# ============================
+# 虚拟环境
+# ============================
+venv/
+.venv/
+env/
+.env
+*.venv
+
+# ============================
+# IDE
+# ============================
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# ============================
+# 系统文件
+# ============================
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ============================
+# ComfyUI 测试输出
+# ============================
+comfyuiTest/image/
+
+# ============================
+# 环境变量文件
+# ============================
+.env
+.env.local
+.env.*.local
+
+# ============================
+# weflow-core
+# ============================
+weflow-core/config.json
+weflow-core/node_modules/
+weflow-core/dist/
+
+# ============================
+# 二进制文件
+# ============================
+*.exe
+
+# ============================
+# 日志
+# ============================
+*.log
+logs/
+
+# ============================
+# 其他
+# ============================
+serverStatus.png
+/data/emoji/*
+/config.json
+uuid_sync_result.txt
+*_test_*.py
+*_test_*.out
+*_verify_*.py
+*_verify_*.out
+
+# ============================
+# 临时诊断脚本与导出文件（保留本地，暂不上传）
+# ============================
+/_check_lp_db.py
+/_diagnose_tournament.py
+/_diagnose_tournament.out
+/_manual_recompute_tournament.py
+/_manual_sync_lp_3_6.py
+/_rcon_raw_lp_3_6.py
+/*.jsonl
+
+# 损坏备份、运行时本地存储和离线参考项目
+data/*.corrupt-backup-*
+data/local_store.json
+data/weclone/
+weclone_reference/
+
+# 本地临时测试目录
+/tests/
+prompt.txt
+# Local one-off LLM cache probe output
+/_cache_probe_results.txt
+
+# Locally downloaded VB-CABLE installer cache
+/scripts/vb-cable/
+
+# ============================
+# 真实配置（含密钥、wxid、群名）：仓库只提交 *.example.json
+# ============================
+config/*.json
+!config/*.example.json
+
+# ============================
+# 抖音搬运/抓包运行时数据与凭据
+# ============================
+data/chrome_douyin/
+data/edge_douyin/
+data/douyin_mitm/
+data/douyin_saved
+data/label_pool
+*.jsonl
+# mitmproxy 抓包 CA（含私钥）
+*.pem
+*.p12
+*.cer

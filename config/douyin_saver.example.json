@@ -1,0 +1,26 @@
+{
+  "group_name": "Your Douyin Group",
+  "group_names": [
+    "Your Douyin Group"
+  ],
+  "save_root": "D:\\douyin_lib\\douyin_saved",
+  "poll_seconds": 15,
+  "scroll_pause_seconds": [
+    1.0,
+    2.2
+  ],
+  "api_cooldown_seconds": [
+    3.0,
+    6.0
+  ],
+  "download_ratio_threshold": 0.5,
+  "download_min_digg": 3,
+  "label_pool_dir": "D:\\douyin_lib\\label_pool",
+  "label_pool_max": 0,
+  "backfill_stats": true,
+  "debug_url": "http://127.0.0.1:9223",
+  "manifest_name": "manifest.json",
+  "mitm_log_dir": "C:\\GSMPSWechatBot\\data\\douyin_mitm",
+  "mitm_wait_seconds": 15,
+  "single_tab": true
+}

@@ -1,0 +1,150 @@
+{
+  "token": "your-weflow-token",
+  "target_group": [
+    "Your Target Group Name"
+  ],
+  "group_features": {
+    "Your Target Group Name": {
+      "plugins_enabled": true,
+      "auto_plugins_enabled": true,
+      "llm_enabled": true
+    }
+  },
+  "prefix": [
+    "@bot"
+  ],
+  "prefix_mode": "strict",
+  "worker_num": 2,
+  "weflow": {
+    "dbPath": "D:\\Documents\\xwechat_files",
+    "decryptKey": "your-64-character-wechat-decrypt-key",
+    "myWxid": "your-wxid",
+    "wxidConfigs": {},
+    "apiHost": "127.0.0.1",
+    "apiPort": 5031,
+    "resourcesPath": "./weflow-core/resources",
+    "messagePushEnabled": true
+  },
+  "frontend": {
+    "weflow_url": "http://127.0.0.1:5031",
+    "sender_url": "http://127.0.0.1:9999"
+  },
+  "music": {
+    "script_dir": "music-source",
+    "node_executable": "node",
+    "quality": "128k",
+    "platform_order": [
+      "wy",
+      "kg",
+      "kw",
+      "tx",
+      "mg"
+    ],
+    "resolve_timeout_seconds": 20,
+    "download_timeout_seconds": 60,
+    "allow_netease_fallback": true,
+    "auto_update_scripts": true,
+    "update_min_interval_hours": 24
+  },
+  "time_slots": [],
+  "rate_limit": {
+    "messages_per_minute": 10,
+    "global_messages_per_minute": 20,
+    "llm_messages_per_minute": 10,
+    "global_llm_messages_per_minute": 20,
+    "prefix_llm_messages_per_minute": 10,
+    "global_prefix_llm_messages_per_minute": 20,
+    "plugin_messages_per_minute": 10,
+    "global_plugin_messages_per_minute": 20,
+    "auto_blacklist_enabled": false,
+    "auto_blacklist_threshold": 5
+  },
+  "llm": {
+    "enabled": true,
+    "history_expire_ms": 600000,
+    "image_tool_enabled": true,
+    "image_tool_max_calls": 1,
+    "image_tool_max_bytes": 8388608,
+    "apis": [
+      {
+        "name": "primary",
+        "protocol": "responses",
+        "model": "your-model-name",
+        "api_key": "your-api-key",
+        "base_url": "https://api.example.com/v1",
+        "timeout_seconds": 60,
+        "supports_images": false,
+        "cache": true,
+        "cache_scope": "full",
+        "responses_explicit_cache_breakpoint": false,
+        "priority": 1
+      }
+    ],
+    "identity": {
+      "name": "Bot",
+      "role": "WeChat group assistant",
+      "style": "Natural, concise, and context-aware",
+      "rules": []
+    },
+    "memory": {
+      "enabled": true
+    },
+    "learning": {
+      "enabled": true,
+      "bot_names": [],
+      "expression_prompt_max_items": 3,
+      "expression_selector_enabled": false,
+      "idle_content_shadow_mode": true,
+      "idle_content_cache_max_age_seconds": 43200,
+      "idle_content_prefetch_min_interval_seconds": 1800,
+      "idle_content_prefetch_min_items": 6
+    },
+    "auto_reply": {
+      "enabled": false,
+      "reply_trigger_mode": "conversation_pulse",
+      "idle_min_seconds": 600,
+      "idle_max_seconds": 1800,
+      "conversation_lease_seconds": 90,
+      "conversation_lease_direct_seconds": 180,
+      "adaptive_idle_content_enabled": false
+    },
+    "group_profiles": {
+      "Your Target Group Name": {
+        "identity": {
+          "name": "Group Bot",
+          "role": "A regular member of the group who joins conversation naturally",
+          "style": "Natural, concise, and context-aware",
+          "rules": [
+            "Follow the surrounding context and group tone.",
+            "Prefer a short social reply in casual banter; answer clearly when a real question is asked."
+          ]
+        },
+        "reply_style": "Natural and concise; adapt to the group rather than using a fixed persona.",
+        "behavior_style": "Judge the whole context before replying. Do not rely only on a name or keyword.",
+        "group_prompt": "Participate naturally in this group chat without changing the router message format.",
+        "private_prompt": "Reply naturally and briefly in private chat.",
+        "auto_reply": {
+          "enabled": false,
+          "reply_trigger_mode": "conversation_pulse",
+          "idle_min_seconds": 600,
+          "idle_max_seconds": 1800,
+          "conversation_lease_seconds": 90,
+          "conversation_lease_direct_seconds": 180
+        },
+        "proactive": {
+          "enabled": false,
+          "group_enabled": true,
+          "private_enabled": false,
+          "aggressiveness": 0.25
+        },
+        "prefixes": [
+          "@bot"
+        ]
+      }
+    }
+  },
+  "voice_sender": {
+    "playback_device_name": "CABLE Input",
+    "capture_device_name": "CABLE Output"
+  }
+}
